@@ -249,8 +249,11 @@ describe("ответы LLM", () => {
 	it("короткий новый вопрос не перехватывается готовым ответом", async () => {
 		vi.spyOn(globalThis, "fetch").mockImplementation(async () => llmReply("Завтра солнечно."));
 		await env.ANSWERS.put("a:short", JSON.stringify({ status: "done", id: "x", text: "Старый ответ." }));
-		expect((await say("а погода завтра?", { userId: "short" })).response.text).toBe("Завтра солнечно.");
+		const text = (await say("а погода завтра?", { userId: "short" })).response.text;
+		expect(text.startsWith("Завтра солнечно.")).toBe(true);
 		expect(await env.ANSWERS.get("a:short")).toBeNull();
+		// Старый ответ не выброшен — отложен для «что ты ответил».
+		expect((await env.ANSWERS.get("u:short", "json")).text).toBe("Старый ответ.");
 	});
 });
 
@@ -399,5 +402,113 @@ describe("настройки модели", () => {
 		await call({ body: aliceBody("вопрос", { userId: "cfg-3" }), extraEnv: { API_URL: undefined, MODEL: undefined } });
 		expect(spy.mock.calls[0][0]).toBe("https://ai.starimg.ru/v1/messages");
 		expect(JSON.parse(spy.mock.calls[0][1].body).model).toBe("deepseek-v4.1-flash");
+	});
+});
+
+describe("забыть один факт", () => {
+	it("удаляет один факт по совпадению", async () => {
+		await say("запомни, что я люблю чай", { userId: "f1" });
+		await say("запомни, что у меня есть кот", { userId: "f1" });
+		expect((await say("Забудь, что я люблю чай", { userId: "f1" })).response.text).toBe("Забыл: я люблю чай.");
+		const list = (await say("что ты обо мне знаешь", { userId: "f1" })).response.text;
+		expect(list).not.toContain("чай");
+		expect(list).toContain("кот");
+	});
+
+	it("находит факт по части фразы", async () => {
+		await say("запомни, что моя собака Рекс", { userId: "f2" });
+		expect((await say("забудь про собаку", { userId: "f2" })).response.text).toContain("Такого я не запоминал");
+		expect((await say("забудь про рекс", { userId: "f2" })).response.text).toBe("Забыл: моя собака Рекс.");
+	});
+
+	it("просит уточнить, если подходит несколько фактов", async () => {
+		await say("запомни, что я люблю чай", { userId: "f3" });
+		await say("запомни, что я люблю кофе", { userId: "f3" });
+		const text = (await say("забудь, что я люблю", { userId: "f3" })).response.text;
+		expect(text).toContain("Нашёл несколько");
+		expect((await say("что ты обо мне знаешь", { userId: "f3" })).response.text).toContain("чай");
+	});
+
+	it("«забудь всё обо мне» по-прежнему удаляет все факты", async () => {
+		await say("запомни, что я люблю чай", { userId: "f4" });
+		await say("забудь всё обо мне", { userId: "f4" });
+		expect((await say("что ты обо мне знаешь", { userId: "f4" })).response.text).toContain("Пока ничего");
+	});
+});
+
+describe("пропущенный ответ", () => {
+	afterEach(() => vi.restoreAllMocks());
+
+	const llmReply = (text) =>
+		new Response(JSON.stringify({ content: [{ type: "text", text }] }), { headers: { "content-type": "application/json" } });
+
+	function deferred() {
+		let resolve;
+		const promise = new Promise((r) => (resolve = r));
+		return { promise, resolve };
+	}
+
+	async function start(utterance, userId) {
+		const ctx = createExecutionContext();
+		const req = new Request("http://example.com/", { method: "POST", body: JSON.stringify(aliceBody(utterance, { userId })) });
+		const res = await worker.fetch(req, env, ctx);
+		return { text: (await res.json()).response.text, done: () => waitOnExecutionContext(ctx) };
+	}
+
+	it("готовый ответ не пропадает, если вместо «ну» задали новый вопрос", async () => {
+		const d = deferred();
+		vi.spyOn(globalThis, "fetch")
+			.mockImplementationOnce(() => d.promise)
+			.mockImplementationOnce(async () => llmReply("Ответ на второй."));
+		const q1 = await start("первый длинный вопрос", "skip");
+		d.resolve(llmReply("Ответ на первый."));
+		await q1.done();
+
+		const second = (await say("второй вопрос", { userId: "skip" })).response.text;
+		expect(second).toBe("Ответ на второй. Кстати, ответ на прошлый вопрос готов — скажите «что ты ответил».");
+		expect((await say("Что ты ответил?", { userId: "skip" })).response.text).toBe(
+			"На вопрос «первый длинный вопрос»: Ответ на первый."
+		);
+		// Забрали — второй раз уже последний ответ из истории.
+		expect((await say("повтори", { userId: "skip" })).response.text).toBe("Ответ на второй.");
+	});
+
+	it("ответ, досчитанный после нового вопроса, можно забрать", async () => {
+		const d1 = deferred();
+		vi.spyOn(globalThis, "fetch")
+			.mockImplementationOnce(() => d1.promise)
+			.mockImplementationOnce(async () => llmReply("Ответ на второй."));
+		const q1 = await start("первый длинный вопрос", "late");
+		expect((await say("второй вопрос", { userId: "late" })).response.text).toBe("Ответ на второй.");
+		d1.resolve(llmReply("Ответ на первый."));
+		await q1.done();
+
+		expect((await say("что ты ответил", { userId: "late" })).response.text).toBe(
+			"На вопрос «первый длинный вопрос»: Ответ на первый."
+		);
+		// Услышанный ответ попадает в историю.
+		const history = await env.ANSWERS.get("h:late", "json");
+		expect(history.map((m) => m.content)).toEqual([
+			"второй вопрос",
+			"Ответ на второй.",
+			"первый длинный вопрос",
+			"Ответ на первый.",
+		]);
+	});
+
+	it("«повтори» возвращает последний ответ", async () => {
+		vi.spyOn(globalThis, "fetch").mockImplementation(async () => llmReply("Четыре."));
+		await say("сколько будет два плюс два", { userId: "repeat" });
+		expect((await say("повтори", { userId: "repeat" })).response.text).toBe("Четыре.");
+	});
+
+	it("«что ты ответил» без истории", async () => {
+		expect((await say("что ты ответил", { userId: "empty" })).response.text).toContain("ничего не отвечал");
+	});
+
+	it("«что ты ответил» забирает отложенный ответ, как «ну»", async () => {
+		await env.ANSWERS.put("a:prev-done", JSON.stringify({ status: "done", id: "x", text: "Готово.", question: "вопрос" }));
+		expect((await say("что ты ответил", { userId: "prev-done" })).response.text).toBe("Готово.");
+		expect(await env.ANSWERS.get("a:prev-done")).toBeNull();
 	});
 });

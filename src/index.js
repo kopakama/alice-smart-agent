@@ -11,6 +11,8 @@
 //   «запомни, что …»            — добавить факт
 //   «что ты обо мне знаешь»      — перечислить факты
 //   «забудь всё обо мне»         — удалить факты
+//   «забудь, что …» / «забудь про …» — удалить один факт
+//   «что ты ответил» / «повтори» — ответ, который пользователь пропустил, или последний ответ
 //   «забудь» / «новая тема»      — очистить только диалог
 //   «помощь» / «что ты умеешь»   — справка
 //   «пока» / «хватит»            — завершить сессию
@@ -44,6 +46,10 @@ const RESET_FACTS = ["забудь всё обо мне", "забудь все �
 const LIST_FACTS = ["что ты обо мне знаешь", "что ты помнишь", "что ты про меня знаешь", "что ты запомнил"];
 const BYE = ["пока", "хватит", "стоп", "выход", "выйти", "до свидания", "закрой навык"];
 const HELP = ["помощь", "что ты умеешь", "что ты можешь", "справка"];
+const PREV_ANSWER = [
+	"что ты ответил", "что ты сказал", "прошлый ответ", "а на прошлый вопрос", "что ты ответил на прошлый вопрос",
+	"повтори", "повтори ответ",
+];
 // Реплики, которыми забирают отложенный ответ. Остальные — новый вопрос, даже короткий.
 const FOLLOW_UP = [
 	"ну", "ну и", "ну что", "ну как", "ну и что", "ну давай", "и", "и что", "и как", "ага", "угу", "да",
@@ -86,6 +92,8 @@ export default {
 		const answerKey = `a:${uid}`;
 		const historyKey = `h:${uid}`;
 		const factsKey = `f:${uid}`;
+		const unheardKey = `u:${uid}`;
+		const forgetQuery = norm.match(/^забудь (?:что|про|о|об) (.+)$/)?.[1];
 
 		let text;
 		let endSession = false;
@@ -101,7 +109,8 @@ export default {
 		} else if (HELP.includes(norm)) {
 			text =
 				"Задайте любой вопрос, отвечу коротко. Скажите «запомни, что…», чтобы я запомнил факт о вас, " +
-				"«что ты обо мне знаешь» — перечислю, «забудь» — начнём тему заново, «пока» — выйду.";
+				"«что ты обо мне знаешь» — перечислю, «забудь, что…» — удалю, «что ты ответил» — повторю ответ, " +
+				"«забудь» — начнём тему заново, «пока» — выйду.";
 		} else if (RESET_FACTS.includes(norm)) {
 			ctx.waitUntil(kvDelete(env, factsKey));
 			text = "Хорошо, я забыл всё, что вы просили запомнить.";
@@ -113,6 +122,22 @@ export default {
 			text = facts.length
 				? "Я помню вот что: " + facts.join(". ") + "."
 				: "Пока ничего. Скажите «запомни, что…», и я запомню.";
+		} else if (forgetQuery) {
+			const facts = (await kvGet(env, factsKey)) || [];
+			const matches = facts.filter((f) => {
+				const n = normalize(f);
+				return n.includes(forgetQuery) || forgetQuery.includes(n);
+			});
+			if (!matches.length) {
+				text = "Такого я не запоминал. Чтобы начать разговор заново, скажите «забудь».";
+			} else if (new Set(matches).size > 1) {
+				text = "Нашёл несколько: " + matches.join(". ") + ". Скажите точнее, что забыть.";
+			} else {
+				const rest = facts.filter((f) => f !== matches[0]);
+				text = (await kvPut(env, factsKey, JSON.stringify(rest)))
+					? `Забыл: ${matches[0]}.`
+					: "Не получилось забыть. Попробуйте позже.";
+			}
 		} else if (/^запомни(\s|$)/.test(norm)) {
 			const fact = utterance.replace(/^запомни[\s,:-]*(что\s+)?/i, "").trim();
 			if (!fact) {
@@ -129,15 +154,35 @@ export default {
 		} else {
 			// Всё нужное читаем разом: у Алисы жёсткий таймаут на ответ.
 			const rateKey = `r:${uid}:${new Date().toISOString().slice(0, 10)}`;
-			const [saved, history, facts, used] = await Promise.all([
+			const [saved, history, facts, used, unheard] = await Promise.all([
 				kvGet(env, answerKey),
 				kvGet(env, historyKey),
 				kvGet(env, factsKey),
 				kvGet(env, rateKey),
+				PREV_ANSWER.includes(norm) ? kvGet(env, unheardKey) : null,
 			]);
 			const limit = dailyLimit(env);
 
-			if (saved && FOLLOW_UP.includes(norm)) {
+			if (PREV_ANSWER.includes(norm)) {
+				// Сначала то, что пользователь ещё не слышал, потом — последний ответ из истории.
+				const lastAnswer = (history || []).findLast((m) => m.role === "assistant")?.content;
+				if (saved?.status === "done") {
+					text = saved.text;
+					ctx.waitUntil(kvDelete(env, answerKey));
+				} else if (unheard) {
+					text = (unheard.question ? `На вопрос «${unheard.question}»: ` : "") + unheard.text;
+					ctx.waitUntil(kvDelete(env, unheardKey));
+					if (!unheard.inHistory && unheard.question) {
+						ctx.waitUntil(appendHistory(env, historyKey, unheard.question, unheard.text));
+					}
+				} else if (saved && !isStale(saved)) {
+					text = "Ещё думаю, секунду.";
+				} else if (lastAnswer) {
+					text = lastAnswer;
+				} else {
+					text = "Я пока ничего не отвечал. Задайте вопрос.";
+				}
+			} else if (saved && FOLLOW_UP.includes(norm)) {
 				if (saved.status === "done") {
 					text = saved.text;
 				} else if (isStale(saved)) {
@@ -164,16 +209,24 @@ export default {
 					new Promise((resolve) => setTimeout(() => resolve(null), INLINE_WAIT_MS)),
 				]);
 
+				// Готовый, но не услышанный ответ не выбрасываем молча: откладываем и подсказываем, как его забрать.
+				let hint = "";
+				if (saved?.status === "done") {
+					const skipped = { question: saved.question, text: saved.text, inHistory: true };
+					ctx.waitUntil(kvPut(env, unheardKey, JSON.stringify(skipped), { expirationTtl: ANSWER_TTL }));
+					hint = " Кстати, ответ на прошлый вопрос готов — скажите «что ты ответил».";
+				}
+
 				// В историю попадают только ответы, которые пользователь услышит (или сможет забрать через «ну»).
 				if (quick !== null) {
-					text = quick.text;
+					text = quick.text + hint;
 					if (quick.ok) ctx.waitUntil(appendHistory(env, historyKey, utterance, quick.text));
 					if (saved) ctx.waitUntil(kvDelete(env, answerKey));
 				} else {
-					const pending = { status: "pending", id: jobId, started: Date.now() };
+					const pending = { status: "pending", id: jobId, started: Date.now(), question: utterance };
 					await kvPut(env, answerKey, JSON.stringify(pending), { expirationTtl: ANSWER_TTL });
-					ctx.waitUntil(job.then((res) => finishJob(env, answerKey, jobId, res, historyKey, utterance)));
-					text = "Секунду, думаю.";
+					ctx.waitUntil(job.then((res) => finishJob(env, answerKey, jobId, res, historyKey, utterance, unheardKey)));
+					text = "Секунду, думаю." + hint;
 				}
 			}
 		}
@@ -228,10 +281,18 @@ function isStale(saved) {
 	return saved.status === "pending" && !(Date.now() - saved.started < PENDING_STALE_MS);
 }
 
-async function finishJob(env, key, jobId, res, historyKey, utterance) {
+async function finishJob(env, key, jobId, res, historyKey, utterance, unheardKey) {
 	const current = await kvGet(env, key);
-	if (current?.id !== jobId) return; // пока думали, задали новый вопрос — этот ответ никто не услышит
-	await kvPut(env, key, JSON.stringify({ status: "done", id: jobId, text: res.text }), { expirationTtl: ANSWER_TTL });
+	if (current?.id !== jobId) {
+		// Пока думали, задали новый вопрос: ответ не озвучим, но его можно забрать через «что ты ответил».
+		if (res.ok) {
+			const skipped = { question: utterance, text: res.text, inHistory: false };
+			await kvPut(env, unheardKey, JSON.stringify(skipped), { expirationTtl: ANSWER_TTL });
+		}
+		return;
+	}
+	const done = { status: "done", id: jobId, text: res.text, question: utterance };
+	await kvPut(env, key, JSON.stringify(done), { expirationTtl: ANSWER_TTL });
 	if (res.ok) await appendHistory(env, historyKey, utterance, res.text);
 }
 
