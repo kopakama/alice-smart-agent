@@ -1,0 +1,19 @@
+# Раз в неделю Dependabot открывает pull request с обновлениями; тесты гоняются на нём автоматически.
+version: 2
+updates:
+  - package-ecosystem: npm
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      # Все dev-зависимости (wrangler, vitest, плагин) — одним PR, чтобы не было пачки мелких.
+      dev-dependencies:
+        dependency-type: development
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      actions:
+        patterns: ["*"]
