@@ -23,10 +23,13 @@
 //   переменная SKILL_ID — id навыка в Яндекс Диалогах (wrangler.jsonc, vars)
 //   переменная DAILY_LIMIT — вопросов к LLM в сутки на пользователя (по умолчанию 100, 0 — без лимита)
 
+// Значения по умолчанию; переопределяются переменными API_URL и MODEL в wrangler.jsonc (vars).
 const API_URL = "https://ai.starimg.ru/v1/messages";
 const MODEL = "deepseek-v4.1-flash";
-const INLINE_WAIT_MS = 2000;     // Алиса ждёт ответ вебхука ~3 с, оставляем запас на KV
-const API_TIMEOUT_MS = 25000;
+const INLINE_WAIT_MS = 2500;     // Алиса ждёт ответ вебхука ~3 с; KV читается параллельно, запаса хватает
+const API_TIMEOUT_MS = 25000;    // на все попытки вместе
+const API_ATTEMPTS = 2;
+const MAX_TOKENS = 200;
 const PENDING_STALE_MS = 35000;  // «думаю» дольше этого — задание умерло, не ждём его
 const HISTORY_MESSAGES = 10;
 const HISTORY_TTL = 24 * 3600;   // диалог помним сутки
@@ -154,27 +157,22 @@ export default {
 				// иначе медленный старый вопрос перезапишет ответ на более новый.
 				const jobId = crypto.randomUUID();
 
-				const job = ask(system, messages, env.ANTHROPIC_API_KEY).then(async (res) => {
-					if (res.ok) {
-						const updated = [...messages, { role: "assistant", content: res.text }].slice(-HISTORY_MESSAGES);
-						await kvPut(env, historyKey, JSON.stringify(updated), { expirationTtl: HISTORY_TTL });
-					}
-					return res.text;
-				});
+				const job = ask(system, messages, env);
 
 				const quick = await Promise.race([
 					job,
 					new Promise((resolve) => setTimeout(() => resolve(null), INLINE_WAIT_MS)),
 				]);
 
+				// В историю попадают только ответы, которые пользователь услышит (или сможет забрать через «ну»).
 				if (quick !== null) {
-					text = quick;
-					ctx.waitUntil(job);
+					text = quick.text;
+					if (quick.ok) ctx.waitUntil(appendHistory(env, historyKey, utterance, quick.text));
 					if (saved) ctx.waitUntil(kvDelete(env, answerKey));
 				} else {
 					const pending = { status: "pending", id: jobId, started: Date.now() };
 					await kvPut(env, answerKey, JSON.stringify(pending), { expirationTtl: ANSWER_TTL });
-					ctx.waitUntil(job.then((answer) => finishJob(env, answerKey, jobId, answer)));
+					ctx.waitUntil(job.then((res) => finishJob(env, answerKey, jobId, res, historyKey, utterance)));
 					text = "Секунду, думаю.";
 				}
 			}
@@ -184,7 +182,7 @@ export default {
 			JSON.stringify({
 				version: alice.version,
 				session: alice.session,
-				response: { text: text.slice(0, 1024), end_session: endSession },
+				response: { text: text.length > 1024 ? cutToSentence(text, 1024) : text, end_session: endSession },
 			}),
 			{ headers: { "Content-Type": "application/json; charset=utf-8" } }
 		);
@@ -230,10 +228,43 @@ function isStale(saved) {
 	return saved.status === "pending" && !(Date.now() - saved.started < PENDING_STALE_MS);
 }
 
-async function finishJob(env, key, jobId, text) {
+async function finishJob(env, key, jobId, res, historyKey, utterance) {
 	const current = await kvGet(env, key);
-	if (current?.id !== jobId) return; // пока думали, задали новый вопрос
-	await kvPut(env, key, JSON.stringify({ status: "done", id: jobId, text }), { expirationTtl: ANSWER_TTL });
+	if (current?.id !== jobId) return; // пока думали, задали новый вопрос — этот ответ никто не услышит
+	await kvPut(env, key, JSON.stringify({ status: "done", id: jobId, text: res.text }), { expirationTtl: ANSWER_TTL });
+	if (res.ok) await appendHistory(env, historyKey, utterance, res.text);
+}
+
+// Дописываем к актуальной истории, а не к снимку на момент вопроса: иначе параллельный вопрос затрёт соседний.
+async function appendHistory(env, historyKey, question, answer) {
+	const history = (await kvGet(env, historyKey)) || [];
+	const updated = [...history, { role: "user", content: question }, { role: "assistant", content: answer }];
+	await kvPut(env, historyKey, JSON.stringify(updated.slice(-HISTORY_MESSAGES)), { expirationTtl: HISTORY_TTL });
+}
+
+// Голосом разметку не прочитать: убираем markdown, списки и эмодзи.
+function toSpeech(text) {
+	return text
+		.replace(/```[\s\S]*?```/g, " ")
+		.replace(/\[([^\]]+)\]\([^)]*\)/g, "$1")
+		.replace(/\p{Extended_Pictographic}️?/gu, "")
+		.replace(/[*_`#>]+/g, "")
+		.split("\n")
+		.map((line) => line.replace(/^\s*(?:[-•–]|\d+[.)])\s+/, "").trim())
+		.filter(Boolean)
+		.map((line, i, lines) => (i < lines.length - 1 && !/[.!?…:;,]$/.test(line) ? line + "." : line))
+		.join(" ")
+		.replace(/\s+/g, " ")
+		.trim();
+}
+
+// Обрезка по концу предложения, чтобы Алиса не обрывала фразу на полуслове.
+function cutToSentence(text, max = Infinity) {
+	const cut = text.slice(0, max);
+	const ends = [...cut.matchAll(/[.!?…](?=\s|$)/g)];
+	const last = ends.at(-1);
+	if (last && last.index > cut.length * 0.3) return cut.slice(0, last.index + 1);
+	return cut.length < text.length ? cut.slice(0, max - 1).trimEnd() + "…" : cut + "…";
 }
 
 // Сравнение за постоянное время, чтобы секретный путь нельзя было подобрать по времени ответа.
@@ -257,32 +288,48 @@ function normalize(s) {
 	return s.toLowerCase().replace(/ё/g, "е").replace(/[?!.,]/g, " ").replace(/\s+/g, " ").trim();
 }
 
-async function ask(system, messages, apiKey) {
+// Один повтор при 5xx или сетевой ошибке; общий бюджет времени — API_TIMEOUT_MS на обе попытки.
+async function ask(system, messages, env) {
+	const apiKey = env.ANTHROPIC_API_KEY;
+	const apiUrl = env.API_URL || API_URL;
+	const model = env.MODEL || MODEL;
 	const ctrl = new AbortController();
 	const timer = setTimeout(() => ctrl.abort(), API_TIMEOUT_MS);
 	const started = Date.now();
 	try {
-		const r = await fetch(API_URL, {
-			method: "POST",
-			signal: ctrl.signal,
-			headers: {
-				"x-api-key": apiKey,
-				"Authorization": `Bearer ${apiKey}`,
-				"anthropic-version": "2023-06-01",
-				"content-type": "application/json",
-			},
-			body: JSON.stringify({ model: MODEL, max_tokens: 200, system, messages }),
-		});
+		for (let attempt = 1; ; attempt++) {
+			const retry = attempt < API_ATTEMPTS;
+			let r;
+			try {
+				r = await fetch(apiUrl, {
+					method: "POST",
+					signal: ctrl.signal,
+					headers: {
+						"x-api-key": apiKey,
+						"Authorization": `Bearer ${apiKey}`,
+						"anthropic-version": "2023-06-01",
+						"content-type": "application/json",
+					},
+					body: JSON.stringify({ model, max_tokens: MAX_TOKENS, system, messages }),
+				});
+			} catch (e) {
+				console.log("API exception after", Date.now() - started, "ms, attempt", attempt, ":", String(e));
+				if (retry && !ctrl.signal.aborted) continue;
+				return { ok: false, text: "Ответ так и не пришёл. Спросите ещё раз." };
+			}
 
-		if (!r.ok) {
-			console.log("API error", r.status, await r.text());
-			return { ok: false, text: "Не получилось получить ответ. Попробуйте ещё раз." };
+			if (!r.ok) {
+				console.log("API error", r.status, "attempt", attempt, await r.text());
+				if (retry && r.status >= 500) continue;
+				return { ok: false, text: "Не получилось получить ответ. Попробуйте ещё раз." };
+			}
+
+			const data = await r.json();
+			console.log("Answered in", Date.now() - started, "ms, model", model, ", attempt", attempt, ", history:", messages.length - 1);
+			let text = toSpeech(data.content?.map((b) => b.text || "").join("") || "");
+			if (text && data.stop_reason === "max_tokens") text = cutToSentence(text);
+			return text ? { ok: true, text } : { ok: false, text: "Пустой ответ." };
 		}
-
-		const data = await r.json();
-		console.log("Answered in", Date.now() - started, "ms, history:", messages.length - 1);
-		const text = data.content?.map((b) => b.text || "").join("").trim();
-		return text ? { ok: true, text } : { ok: false, text: "Пустой ответ." };
 	} catch (e) {
 		console.log("API exception after", Date.now() - started, "ms:", String(e));
 		return { ok: false, text: "Ответ так и не пришёл. Спросите ещё раз." };

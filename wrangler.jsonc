@@ -3,7 +3,9 @@
 	"main": "src/index.js",
 	"compatibility_date": "2026-09-01",
 	"vars": {
-		"SKILL_ID": "298c0497-638b-418f-a4e9-d65121023468"
+		"SKILL_ID": "298c0497-638b-418f-a4e9-d65121023468",
+		"API_URL": "https://ai.starimg.ru/v1/messages",
+		"MODEL": "deepseek-v4.1-flash"
 	},
 	"observability": {
 		"logs": {

@@ -253,3 +253,151 @@ describe("ответы LLM", () => {
 		expect(await env.ANSWERS.get("a:short")).toBeNull();
 	});
 });
+
+describe("качество ответов", () => {
+	afterEach(() => vi.restoreAllMocks());
+
+	const llmReply = (text, stop_reason = "end_turn") =>
+		new Response(JSON.stringify({ content: [{ type: "text", text }], stop_reason }), {
+			headers: { "content-type": "application/json" },
+		});
+
+	function deferred() {
+		let resolve;
+		const promise = new Promise((r) => (resolve = r));
+		return { promise, resolve };
+	}
+
+	it("параллельный медленный вопрос не затирает историю нового", async () => {
+		const d1 = deferred();
+		vi.spyOn(globalThis, "fetch")
+			.mockImplementationOnce(() => d1.promise)
+			.mockImplementationOnce(async () => llmReply("Ответ на второй."));
+
+		const ctx1 = createExecutionContext();
+		const req1 = new Request("http://example.com/", {
+			method: "POST",
+			body: JSON.stringify(aliceBody("первый длинный вопрос", { userId: "hist" })),
+		});
+		const res1 = await worker.fetch(req1, env, ctx1);
+		expect((await res1.json()).response.text).toBe("Секунду, думаю.");
+
+		expect((await say("второй вопрос", { userId: "hist" })).response.text).toBe("Ответ на второй.");
+
+		d1.resolve(llmReply("Ответ на первый."));
+		await waitOnExecutionContext(ctx1);
+
+		// Первый ответ пользователь так и не услышал — в истории только второй обмен.
+		expect(await env.ANSWERS.get("h:hist", "json")).toEqual([
+			{ role: "user", content: "второй вопрос" },
+			{ role: "assistant", content: "Ответ на второй." },
+		]);
+	});
+
+	it("отложенный ответ попадает в историю", async () => {
+		const d = deferred();
+		vi.spyOn(globalThis, "fetch").mockImplementation(() => d.promise);
+		const ctx = createExecutionContext();
+		const req = new Request("http://example.com/", {
+			method: "POST",
+			body: JSON.stringify(aliceBody("долгий вопрос", { userId: "hist-slow" })),
+		});
+		await worker.fetch(req, env, ctx);
+		d.resolve(llmReply("Долгий ответ."));
+		await waitOnExecutionContext(ctx);
+		expect(await env.ANSWERS.get("h:hist-slow", "json")).toEqual([
+			{ role: "user", content: "долгий вопрос" },
+			{ role: "assistant", content: "Долгий ответ." },
+		]);
+	});
+
+	it("убирает markdown, списки и эмодзи", async () => {
+		vi.spyOn(globalThis, "fetch").mockImplementation(async () =>
+			llmReply("**Москва** — столица 🙂\n\n- Кремль\n- Красная площадь\n\nПодробнее [тут](https://example.com).")
+		);
+		expect((await say("расскажи про москву", { userId: "md" })).response.text).toBe(
+			"Москва — столица. Кремль. Красная площадь. Подробнее тут."
+		);
+	});
+
+	it("обрезает оборванный ответ до последнего предложения", async () => {
+		vi.spyOn(globalThis, "fetch").mockImplementation(async () =>
+			llmReply("Первое предложение. Второе предложение. А третье оборвало", "max_tokens")
+		);
+		expect((await say("длинный рассказ", { userId: "cut" })).response.text).toBe("Первое предложение. Второе предложение.");
+	});
+
+	it("не обрезает законченный ответ", async () => {
+		vi.spyOn(globalThis, "fetch").mockImplementation(async () => llmReply("Да. Но есть нюанс"));
+		expect((await say("вопрос", { userId: "nocut" })).response.text).toBe("Да. Но есть нюанс");
+	});
+
+	it("укладывает ответ в 1024 символа по границе предложения", async () => {
+		const long = "Это довольно длинное предложение для проверки. ".repeat(40);
+		vi.spyOn(globalThis, "fetch").mockImplementation(async () => llmReply(long));
+		const text = (await say("вопрос", { userId: "long" })).response.text;
+		expect(text.length).toBeLessThanOrEqual(1024);
+		expect(text.endsWith("проверки.")).toBe(true);
+	});
+
+	it("повторяет запрос при 5xx", async () => {
+		const spy = vi
+			.spyOn(globalThis, "fetch")
+			.mockImplementationOnce(async () => new Response("bad gateway", { status: 502 }))
+			.mockImplementationOnce(async () => llmReply("Со второго раза."));
+		expect((await say("вопрос", { userId: "retry" })).response.text).toBe("Со второго раза.");
+		expect(spy).toHaveBeenCalledTimes(2);
+	});
+
+	it("повторяет запрос при сетевой ошибке", async () => {
+		const spy = vi
+			.spyOn(globalThis, "fetch")
+			.mockImplementationOnce(async () => {
+				throw new Error("network down");
+			})
+			.mockImplementationOnce(async () => llmReply("Сеть вернулась."));
+		expect((await say("вопрос", { userId: "retry-net" })).response.text).toBe("Сеть вернулась.");
+		expect(spy).toHaveBeenCalledTimes(2);
+	});
+
+	it("не повторяет запрос при 4xx", async () => {
+		const spy = vi.spyOn(globalThis, "fetch").mockImplementation(async () => new Response("bad key", { status: 401 }));
+		expect((await say("вопрос", { userId: "no-retry" })).response.text).toContain("Не получилось");
+		expect(spy).toHaveBeenCalledTimes(1);
+	});
+
+	it("сдаётся после двух неудачных попыток", async () => {
+		const spy = vi.spyOn(globalThis, "fetch").mockImplementation(async () => new Response("down", { status: 503 }));
+		expect((await say("вопрос", { userId: "give-up" })).response.text).toContain("Не получилось");
+		expect(spy).toHaveBeenCalledTimes(2);
+	});
+});
+
+describe("настройки модели", () => {
+	afterEach(() => vi.restoreAllMocks());
+
+	const ok = async () =>
+		new Response(JSON.stringify({ content: [{ type: "text", text: "Ок." }] }), { headers: { "content-type": "application/json" } });
+
+	it("берёт MODEL и API_URL из wrangler.jsonc", async () => {
+		const spy = vi.spyOn(globalThis, "fetch").mockImplementation(ok);
+		await say("вопрос", { userId: "cfg" });
+		expect(spy.mock.calls[0][0]).toBe(env.API_URL);
+		expect(JSON.parse(spy.mock.calls[0][1].body).model).toBe(env.MODEL);
+	});
+
+	it("переменные переопределяют значения по умолчанию", async () => {
+		const spy = vi.spyOn(globalThis, "fetch").mockImplementation(ok);
+		const extraEnv = { API_URL: "https://other.example/v1/messages", MODEL: "other-model" };
+		await call({ body: aliceBody("вопрос", { userId: "cfg-2" }), extraEnv });
+		expect(spy.mock.calls[0][0]).toBe("https://other.example/v1/messages");
+		expect(JSON.parse(spy.mock.calls[0][1].body).model).toBe("other-model");
+	});
+
+	it("без переменных работает на значениях по умолчанию", async () => {
+		const spy = vi.spyOn(globalThis, "fetch").mockImplementation(ok);
+		await call({ body: aliceBody("вопрос", { userId: "cfg-3" }), extraEnv: { API_URL: undefined, MODEL: undefined } });
+		expect(spy.mock.calls[0][0]).toBe("https://ai.starimg.ru/v1/messages");
+		expect(JSON.parse(spy.mock.calls[0][1].body).model).toBe("deepseek-v4.1-flash");
+	});
+});
