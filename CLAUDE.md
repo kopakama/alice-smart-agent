@@ -17,6 +17,9 @@
 - Модель: `deepseek-v4.1-flash`
 - Ключ: секрет `ANTHROPIC_API_KEY` (имя историческое, внутри ключ ai.starimg.ru). Ключ шлётся и как `x-api-key`, и как `Authorization: Bearer`
 - KV-хранилище: привязка `ANSWERS`
+- Лимит: `DAILY_LIMIT` вопросов к LLM в сутки на пользователя (по умолчанию 100, `0` — без лимита; задаётся в `wrangler.jsonc` vars)
+- Тесты: `npx vitest run` (без обращения к LLM); CI (`.github/workflows/deploy.yml`) гоняет их перед каждым деплоем
+- Ловушка: `\b` в JS-регулярках не работает с кириллицей — границу слова писать как `(\s|$)`
 
 ## Архитектура `src/index.js`
 
