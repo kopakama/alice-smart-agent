@@ -2,7 +2,7 @@
 // Гибридная схема + память диалога + долгосрочные факты.
 //
 // Быстрый ответ (до INLINE_WAIT_MS) — сразу. Медленный — «Секунду, думаю»,
-// ответ досчитывается в фоне и отдаётся на следующую короткую реплику («ну», «ага»...).
+// ответ досчитывается в фоне и отдаётся на реплику-подтверждение («ну», «ага»..., см. FOLLOW_UP).
 //
 // Память:
 //   • диалог — последние HISTORY_MESSAGES сообщений, живёт HISTORY_TTL (переживает перезапуск навыка);
@@ -25,9 +25,9 @@
 
 const API_URL = "https://ai.starimg.ru/v1/messages";
 const MODEL = "deepseek-v4.1-flash";
-const INLINE_WAIT_MS = 2500;
+const INLINE_WAIT_MS = 2000;     // Алиса ждёт ответ вебхука ~3 с, оставляем запас на KV
 const API_TIMEOUT_MS = 25000;
-const SHORT_REPLY_WORDS = 3;
+const PENDING_STALE_MS = 35000;  // «думаю» дольше этого — задание умерло, не ждём его
 const HISTORY_MESSAGES = 10;
 const HISTORY_TTL = 24 * 3600;   // диалог помним сутки
 const ANSWER_TTL = 3600;
@@ -41,6 +41,11 @@ const RESET_FACTS = ["забудь всё обо мне", "забудь все �
 const LIST_FACTS = ["что ты обо мне знаешь", "что ты помнишь", "что ты про меня знаешь", "что ты запомнил"];
 const BYE = ["пока", "хватит", "стоп", "выход", "выйти", "до свидания", "закрой навык"];
 const HELP = ["помощь", "что ты умеешь", "что ты можешь", "справка"];
+// Реплики, которыми забирают отложенный ответ. Остальные — новый вопрос, даже короткий.
+const FOLLOW_UP = [
+	"ну", "ну и", "ну что", "ну как", "ну и что", "ну давай", "и", "и что", "и как", "ага", "угу", "да",
+	"так", "давай", "дальше", "готово", "что там", "продолжай", "слушаю", "жду", "ответ",
+];
 
 const BASE_SYSTEM =
 	"Ты голосовой ассистент в колонке. Отвечай по-русски, коротко (1–3 предложения), " +
@@ -82,7 +87,10 @@ export default {
 		let text;
 		let endSession = false;
 
-		if (!utterance) {
+		if (norm === "ping") {
+			// Проверка доступности от платформы Диалогов — без LLM и без лимита.
+			text = "pong";
+		} else if (!utterance) {
 			text = "Привет! Задавайте вопрос.";
 		} else if (BYE.includes(norm)) {
 			text = "До свидания!";
@@ -116,21 +124,35 @@ export default {
 					: "Не получилось сохранить. Попробуйте позже.";
 			}
 		} else {
-			const saved = await kvGet(env, answerKey);
+			// Всё нужное читаем разом: у Алисы жёсткий таймаут на ответ.
+			const rateKey = `r:${uid}:${new Date().toISOString().slice(0, 10)}`;
+			const [saved, history, facts, used] = await Promise.all([
+				kvGet(env, answerKey),
+				kvGet(env, historyKey),
+				kvGet(env, factsKey),
+				kvGet(env, rateKey),
+			]);
+			const limit = dailyLimit(env);
 
-			if (saved && isShort(norm)) {
+			if (saved && FOLLOW_UP.includes(norm)) {
 				if (saved.status === "done") {
 					text = saved.text;
-					ctx.waitUntil(kvDelete(env, answerKey));
+				} else if (isStale(saved)) {
+					text = "Ответ так и не пришёл. Спросите ещё раз.";
 				} else {
 					text = "Ещё думаю, секунду.";
 				}
-			} else if (await overLimit(env, uid)) {
+				if (text !== "Ещё думаю, секунду.") ctx.waitUntil(kvDelete(env, answerKey));
+			} else if (limit > 0 && (Number(used) || 0) >= limit) {
 				text = "На сегодня лимит вопросов исчерпан. Попробуйте завтра.";
 			} else {
-				const [history, facts] = await Promise.all([kvGet(env, historyKey), kvGet(env, factsKey)]);
+				ctx.waitUntil(kvPut(env, rateKey, String((Number(used) || 0) + 1), { expirationTtl: RATE_TTL }));
+
 				const messages = [...(history || []), { role: "user", content: utterance }];
 				const system = buildSystem(facts || []);
+				// id задания: отложенный ответ пишется, только если в очереди всё ещё это задание,
+				// иначе медленный старый вопрос перезапишет ответ на более новый.
+				const jobId = crypto.randomUUID();
 
 				const job = ask(system, messages, env.ANTHROPIC_API_KEY).then(async (res) => {
 					if (res.ok) {
@@ -150,12 +172,9 @@ export default {
 					ctx.waitUntil(job);
 					if (saved) ctx.waitUntil(kvDelete(env, answerKey));
 				} else {
-					await kvPut(env, answerKey, JSON.stringify({ status: "pending" }), { expirationTtl: ANSWER_TTL });
-					ctx.waitUntil(
-						job.then((answer) =>
-							kvPut(env, answerKey, JSON.stringify({ status: "done", text: answer }), { expirationTtl: ANSWER_TTL })
-						)
-					);
+					const pending = { status: "pending", id: jobId, started: Date.now() };
+					await kvPut(env, answerKey, JSON.stringify(pending), { expirationTtl: ANSWER_TTL });
+					ctx.waitUntil(job.then((answer) => finishJob(env, answerKey, jobId, answer)));
 					text = "Секунду, думаю.";
 				}
 			}
@@ -200,17 +219,21 @@ async function kvDelete(env, key) {
 	}
 }
 
-// Лимит вопросов к LLM на пользователя в сутки (UTC). Если KV недоступен — не блокируем.
-async function overLimit(env, uid) {
+// Лимит вопросов к LLM на пользователя в сутки (UTC); 0 — без лимита.
+function dailyLimit(env) {
 	const raw = env.DAILY_LIMIT;
-	const limit = raw === undefined || raw === "" || Number.isNaN(Number(raw)) ? DAILY_LIMIT : Number(raw);
-	if (limit <= 0) return false;
+	return raw === undefined || raw === "" || Number.isNaN(Number(raw)) ? DAILY_LIMIT : Number(raw);
+}
 
-	const key = `r:${uid}:${new Date().toISOString().slice(0, 10)}`;
-	const used = Number(await kvGet(env, key)) || 0;
-	if (used >= limit) return true;
-	await kvPut(env, key, String(used + 1), { expirationTtl: RATE_TTL });
-	return false;
+// Записи без started — от старой версии кода, их тоже считаем протухшими.
+function isStale(saved) {
+	return saved.status === "pending" && !(Date.now() - saved.started < PENDING_STALE_MS);
+}
+
+async function finishJob(env, key, jobId, text) {
+	const current = await kvGet(env, key);
+	if (current?.id !== jobId) return; // пока думали, задали новый вопрос
+	await kvPut(env, key, JSON.stringify({ status: "done", id: jobId, text }), { expirationTtl: ANSWER_TTL });
 }
 
 // Сравнение за постоянное время, чтобы секретный путь нельзя было подобрать по времени ответа.
@@ -232,10 +255,6 @@ function buildSystem(facts) {
 
 function normalize(s) {
 	return s.toLowerCase().replace(/ё/g, "е").replace(/[?!.,]/g, " ").replace(/\s+/g, " ").trim();
-}
-
-function isShort(norm) {
-	return norm.split(" ").filter(Boolean).length <= SHORT_REPLY_WORDS;
 }
 
 async function ask(system, messages, apiKey) {
