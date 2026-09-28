@@ -2,6 +2,9 @@
 	"name": "alice-claude",
 	"main": "src/index.js",
 	"compatibility_date": "2026-09-01",
+	"vars": {
+		"SKILL_ID": "298c0497-638b-418f-a4e9-d65121023468"
+	},
 	"observability": {
 		"enabled": true
 	},

@@ -15,6 +15,8 @@
 //
 // Нужно:
 //   секрет ANTHROPIC_API_KEY — ключ ai.starimg.ru
+//   секрет WEBHOOK_SECRET — секретный путь: Webhook URL навыка = https://<воркер>/<WEBHOOK_SECRET>
+//   переменная SKILL_ID — id навыка в Яндекс Диалогах (wrangler.jsonc, vars)
 //   KV-хранилище с привязкой ANSWERS (kv_namespaces в wrangler.jsonc)
 
 const API_URL = "https://ai.starimg.ru/v1/messages";
@@ -37,13 +39,21 @@ const BASE_SYSTEM =
 
 export default {
 	async fetch(req, env, ctx) {
-		if (req.method !== "POST") return new Response("ok");
+		// Без секретного пути воркер молчит: иначе любой мог бы тратить наш баланс LLM.
+		const path = new URL(req.url).pathname;
+		if (req.method !== "POST" || !env.WEBHOOK_SECRET || path !== `/${env.WEBHOOK_SECRET}`) {
+			return new Response("not found", { status: 404 });
+		}
 
 		let alice;
 		try {
 			alice = await req.json();
 		} catch {
 			return new Response("bad json", { status: 400 });
+		}
+
+		if (env.SKILL_ID && alice.session?.skill_id !== env.SKILL_ID) {
+			return new Response("forbidden", { status: 403 });
 		}
 
 		const utterance = (alice.request?.original_utterance || "").trim();
