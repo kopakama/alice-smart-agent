@@ -15,6 +15,7 @@
 //
 // Нужно:
 //   секрет ANTHROPIC_API_KEY — ключ ai.starimg.ru
+// Необязательно (защита включается, только если заданы):
 //   секрет WEBHOOK_SECRET — секретный путь: Webhook URL навыка = https://<воркер>/<WEBHOOK_SECRET>
 //   переменная SKILL_ID — id навыка в Яндекс Диалогах (wrangler.jsonc, vars)
 //   KV-хранилище с привязкой ANSWERS (kv_namespaces в wrangler.jsonc)
@@ -39,9 +40,10 @@ const BASE_SYSTEM =
 
 export default {
 	async fetch(req, env, ctx) {
-		// Без секретного пути воркер молчит: иначе любой мог бы тратить наш баланс LLM.
+		// Если задан WEBHOOK_SECRET — отвечаем только на POST /<секрет>, иначе любой мог бы тратить наш баланс LLM.
+		// Не задан — защита выключена, принимаем любой POST.
 		const path = new URL(req.url).pathname;
-		if (req.method !== "POST" || !env.WEBHOOK_SECRET || path !== `/${env.WEBHOOK_SECRET}`) {
+		if (req.method !== "POST" || (env.WEBHOOK_SECRET && path !== `/${env.WEBHOOK_SECRET}`)) {
 			return new Response("not found", { status: 404 });
 		}
 
