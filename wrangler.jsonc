@@ -1,0 +1,14 @@
+{
+	"name": "alice-claude",
+	"main": "src/index.js",
+	"compatibility_date": "2026-09-01",
+	"observability": {
+		"enabled": true
+	},
+	"kv_namespaces": [
+		{
+			"binding": "ANSWERS",
+			"id": "52058097312a43249eb0b54bac295df5"
+		}
+	]
+}
