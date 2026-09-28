@@ -6,7 +6,13 @@
 		"SKILL_ID": "298c0497-638b-418f-a4e9-d65121023468"
 	},
 	"observability": {
-		"enabled": true
+		"logs": {
+			"enabled": true,
+			"invocation_logs": true
+		},
+		"traces": {
+			"enabled": false
+		}
 	},
 	"kv_namespaces": [
 		{
