@@ -11,8 +11,8 @@
 		"test": "vitest"
 	},
 	"devDependencies": {
-		"@cloudflare/vitest-plugin": "^1.2.7",
-		"vitest": "~4.1.0",
+		"@cloudflare/vitest-plugin": "^1.4.4",
+		"vitest": "~4.1.12",
 		"wrangler": "^4"
 	}
 }
